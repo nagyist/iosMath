@@ -7,8 +7,10 @@
 //
 
 #import <XCTest/XCTest.h>
+#import <CoreText/CoreText.h>
 #import "MTFontManager.h"
 #import "MTFont.h"
+#import "MTFont+Internal.h"
 
 @interface MTFontManagerTest : XCTestCase
 @end
@@ -80,6 +82,68 @@
     XCTAssertNotNil(font, @"Font should load at a non-default size");
     XCTAssertEqualWithAccuracy(font.fontSize, requestedSize, 0.001,
                                @"Returned font should have the requested size");
+}
+
+// LLD §7: every row of the companion table must serve a Latin letter, a digit,
+// and a Greek capital — a fallback face cannot silently miss a glyph.
+- (void)testMathitCompanionCoverageAndSize
+{
+    NSArray<NSString*>* names = @[ MTFontNameLatinModern, MTFontNameXITS, MTFontNameTermes,
+                                   MTFontNameNewComputerModern, MTFontNamePagella,
+                                   MTFontNameSTIXTwo, MTFontNameFiraMath, MTFontNameNotoSansMath ];
+    for (NSString* name in names) {
+        MTFont* font = [MTFontManager.fontManager fontWithName:name size:20];
+        CTFontRef companion = font.mathitCTFont;
+        XCTAssertTrue(companion != NULL, @"%@", name);
+        XCTAssertEqualWithAccuracy(CTFontGetSize(companion), 20.0, 0.001, @"%@", name);
+        unichar chars[3] = { 'f', '1', 0x0393 };
+        CGGlyph glyphs[3];
+        // Returns false if any character has no glyph in the font.
+        XCTAssertTrue(CTFontGetGlyphsForCharacters(companion, chars, glyphs, 3), @"%@", name);
+    }
+}
+
+- (void)testMathitCompanionIsBundledFaceForLatinModernFamily
+{
+    for (NSString* name in @[ MTFontNameLatinModern, MTFontNameNewComputerModern ]) {
+        MTFont* font = [MTFontManager.fontManager fontWithName:name size:20];
+        NSString* ps = CFBridgingRelease(CTFontCopyPostScriptName(font.mathitCTFont));
+        XCTAssertEqualObjects(ps, @"LMRoman10-Italic", @"%@", name);
+    }
+}
+
+- (void)testCopyFontWithSizePreservesMathitCompanion
+{
+    MTFont* font = [MTFontManager.fontManager fontWithName:MTFontNameXITS size:20];
+    MTFont* copy = [font copyFontWithSize:14];
+    XCTAssertTrue(copy.mathitCTFont != NULL);
+    XCTAssertEqualWithAccuracy(CTFontGetSize(copy.mathitCTFont), 14.0, 0.001);
+    // Resizing must keep the same face, not re-resolve it (LLD §6 re-entrancy).
+    NSString* original = CFBridgingRelease(CTFontCopyPostScriptName(font.mathitCTFont));
+    NSString* copied = CFBridgingRelease(CTFontCopyPostScriptName(copy.mathitCTFont));
+    XCTAssertEqualObjects(original, copied);
+
+    // Size 0 means "12pt" to the primary font's constructor but "keep the
+    // current size" to the companion's, so the two can only stay in step if
+    // the companion is built from the primary's resolved size.
+    MTFont* defaulted = [font copyFontWithSize:0];
+    XCTAssertEqualWithAccuracy(CTFontGetSize(defaulted.mathitCTFont),
+                               CTFontGetSize(defaulted.ctFont), 0.001);
+}
+
+// CTFontCreateWithName substitutes silently rather than failing (LLD §2.9);
+// this proves the create -> compare -> reject sequence actually rejects.
+- (void)testVerifiedFontCreationRejectsSubstitution
+{
+    // Without this the test would also pass if CTFontCreateWithName started
+    // returning NULL, which would mean the compare-and-reject never ran.
+    CTFontRef raw = CTFontCreateWithName(CFSTR("MTNoSuchFace-Italic"), 20, NULL);
+    XCTAssertTrue(raw != NULL, @"CoreText no longer substitutes for a missing face");
+    if (raw) { CFRelease(raw); }
+
+    CTFontRef font = MTCreateVerifiedFontWithPostScriptName(@"MTNoSuchFace-Italic", 20);
+    XCTAssertTrue(font == NULL);
+    if (font) { CFRelease(font); }
 }
 
 @end
