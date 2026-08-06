@@ -382,6 +382,14 @@ UTF32Char getBlackboard(unichar ch) {
     return getDefaultStyle(ch);
 }
 
+// \mathit draws these from the text-italic companion face with their plain
+// code points, instead of remapping them into the math-italic block. The set
+// is TeX's class-7 mathchars: Latin letters, digits, capital Greek.
+static BOOL MTIsMathItalicRoutable(unichar ch)
+{
+    return IS_UPPER_EN(ch) || IS_LOWER_EN(ch) || IS_NUMBER(ch) || IS_CAPITAL_GREEK(ch);
+}
+
 static UTF32Char styleCharacter(unichar ch, MTFontStyle fontStyle)
 {
     switch (fontStyle) {
@@ -395,6 +403,9 @@ static UTF32Char styleCharacter(unichar ch, MTFontStyle fontStyle)
             return getBold(ch);
             
         case kMTFontStyleItalic:
+            if (MTIsMathItalicRoutable(ch)) {
+                return ch;
+            }
             return getItalicized(ch);
             
         case kMTFontStyleBoldItalic:
@@ -996,7 +1007,17 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
                 } else {
                     current = [[NSAttributedString alloc] initWithString:atom.nucleus];
                 }
+                NSRange appendedRange = NSMakeRange(_currentLine.length, current.length);
                 [_currentLine appendAttributedString:current];
+                [_currentLine addAttribute:(NSString*) kCTFontAttributeName
+                                     value:(__bridge id) (_styleFont.ctFont)
+                                     range:appendedRange];
+                // Ordinary only: \mathit selects a family for class-7 mathchars, so a
+                // relation or binary operator registered via +addLatexSymbol:value: with
+                // a routable nucleus keeps the math font.
+                if (atom.fontStyle == kMTFontStyleItalic && atom.type == kMTMathAtomOrdinary) {
+                    [self applyMathitFontToRoutableCharactersInRange:appendedRange];
+                }
                 // add the atom to the current range
                 if (_currentLineIndexRange.location == NSNotFound) {
                     _currentLineIndexRange = atom.indexRange;
@@ -1044,10 +1065,31 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
     }
 }
 
+// Gives maximal runs of routable characters the \mathit companion face.
+// Evaluated per character, not per atom: fusion merges a whole \mathit group
+// into one atom, which can mix routable and non-routable characters
+// (\mathit{a\theta b} — theta must stay in the math font, LLD §3.3 C).
+- (void) applyMathitFontToRoutableCharactersInRange:(NSRange) range
+{
+    NSString* string = _currentLine.string;
+    NSUInteger runStart = NSNotFound;
+    for (NSUInteger i = range.location; i <= NSMaxRange(range); i++) {
+        BOOL routable = (i < NSMaxRange(range)) && MTIsMathItalicRoutable([string characterAtIndex:i]);
+        if (routable) {
+            if (runStart == NSNotFound) {
+                runStart = i;
+            }
+        } else if (runStart != NSNotFound) {
+            [_currentLine addAttribute:(NSString*) kCTFontAttributeName
+                                 value:(__bridge id) (_styleFont.mathitCTFont)
+                                 range:NSMakeRange(runStart, i - runStart)];
+            runStart = NSNotFound;
+        }
+    }
+}
+
 - (MTCTLineDisplay*) addDisplayLine
 {
-    // add the font
-    [_currentLine addAttribute:(NSString *)kCTFontAttributeName value:(__bridge id)(_styleFont.ctFont) range:NSMakeRange(0, _currentLine.length)];
     /*NSAssert(_currentLineIndexRange.length == numCodePoints(_currentLine.string),
      @"The length of the current line: %@ does not match the length of the range (%d, %d)",
      _currentLine, _currentLineIndexRange.location, _currentLineIndexRange.length);*/

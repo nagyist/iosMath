@@ -3661,4 +3661,208 @@
     XCTAssertEqualObjects(atoms[2].nucleus, @"1");
 }
 
+// LLD §7 mapping table: routable characters keep plain code points under
+// \mathit; everything else is unchanged from today.
+- (void) testMathitKeepsRoutableCharactersPlain
+{
+    NSDictionary<NSString*, NSString*>* cases = @{
+        @"\\mathit{f}": @"f",
+        @"\\mathit{h}": @"h",              // not U+210E: the companion has its own h
+        @"\\mathit{1}": @"1",
+        @"\\mathit{\\Gamma}": @"Γ",           // routed, not math-italic U+1D6E4
+        @"\\mathit{\\alpha}": @"\U0001D6FC",       // unrouted, identical to \alpha
+        @"\\mathit{\\varepsilon}": @"\U0001D700",  // Greek symbol variants unrouted
+        @"\\Gamma": @"Γ",                     // no \mathit: still upright
+        // one atom mixing routable and unrouted characters (LLD §3.4)
+        @"\\mathit{a\\theta b}": @"a\U0001D703b",
+    };
+    for (NSString* latex in cases) {
+        NSArray<MTMathAtom*>* atoms = [MTTypesetter preprocessMathList:
+            [MTMathListBuilder buildFromString:latex].finalized];
+        XCTAssertEqual(atoms.count, 1, @"%@", latex);
+        XCTAssertEqualObjects(atoms[0].nucleus, cases[latex], @"%@", latex);
+    }
+}
+
+// setFont: re-typesets the same retained (mutated) list; the mapping must be
+// idempotent (LLD §6 re-entrancy).
+- (void) testMathitRetypesetIsIdempotent
+{
+    MTMathList* list = [MTMathListBuilder buildFromString:@"\\mathit{f1\\Gamma}x"].finalized;
+    MTMathListDisplay* first = [MTTypesetter createLineForMathList:list font:self.font style:kMTLineStyleDisplay];
+    MTMathListDisplay* second = [MTTypesetter createLineForMathList:list font:self.font style:kMTLineStyleDisplay];
+    XCTAssertEqualWithAccuracy(first.width, second.width, 0.001);
+}
+
+// Collects (range, PostScript name) for every kCTFontAttributeName run and
+// asserts no character is left without a font.
+- (NSArray<NSArray*>*) fontRunsOfLine:(MTCTLineDisplay*) line
+{
+    NSMutableArray<NSArray*>* runs = [NSMutableArray array];
+    NSAttributedString* str = line.attributedString;
+    [str enumerateAttribute:(NSString*) kCTFontAttributeName
+                    inRange:NSMakeRange(0, str.length)
+                    options:0
+                 usingBlock:^(id value, NSRange range, BOOL* stop) {
+        XCTAssertNotNil(value, @"unstamped range %@ in %@", NSStringFromRange(range), str.string);
+        NSString* ps = CFBridgingRelease(CTFontCopyPostScriptName((__bridge CTFontRef) value));
+        [runs addObject:@[ [NSValue valueWithRange:range], ps ]];
+    }];
+    return runs;
+}
+
+- (void) testMathitStampsCompanionFontPerRange
+{
+    // \mathit{f}x: one CTLine, two font runs — companion on {0,1}, math font
+    // on the U+1D465 surrogate pair. This is the test that catches a missed
+    // addDisplayLine deletion, which a width check cannot (LLD §5).
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{f}x"];
+    XCTAssertEqual(display.subDisplays.count, 1);
+    MTCTLineDisplay* line = (MTCTLineDisplay*) display.subDisplays[0];
+    XCTAssertTrue([line isKindOfClass:[MTCTLineDisplay class]]);
+    NSArray<NSArray*>* runs = [self fontRunsOfLine:line];
+    XCTAssertEqual(runs.count, 2);
+    XCTAssertTrue(NSEqualRanges([runs[0][0] rangeValue], NSMakeRange(0, 1)));
+    XCTAssertEqualObjects(runs[0][1], @"LMRoman10-Italic");
+    XCTAssertTrue(NSEqualRanges([runs[1][0] rangeValue], NSMakeRange(1, 2)));
+    XCTAssertEqualObjects(runs[1][1], @"LatinModernMath-Regular");
+}
+
+- (void) testMathitFlagshipCompanionCoversOnlyAbc
+{
+    // LLD flagship: \mathit reaches only abc; \sin, delimiters, +, and theta
+    // stay in the math font.
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{\\sin(abc + \\theta)}"];
+    NSMutableArray<NSString*>* companionSubstrings = [NSMutableArray array];
+    for (MTDisplay* sub in display.subDisplays) {
+        if (![sub isKindOfClass:[MTCTLineDisplay class]]) continue;
+        MTCTLineDisplay* line = (MTCTLineDisplay*) sub;
+        for (NSArray* run in [self fontRunsOfLine:line]) {
+            if ([run[1] isEqualToString:@"LMRoman10-Italic"]) {
+                [companionSubstrings addObject:[line.attributedString.string substringWithRange:[run[0] rangeValue]]];
+            }
+        }
+    }
+    XCTAssertEqualObjects(companionSubstrings, @[ @"abc" ]);
+}
+
+- (void) testMathitMixedAtomSplitsCompanionRanges
+{
+    // \mathit{a\theta b} is ONE atom; the companion covers {0,1} and {3,1}
+    // with the theta surrogate pair between them in the math font. The case
+    // a per-atom stamp would get wrong (LLD §3.4).
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{a\\theta b}"];
+    XCTAssertEqual(display.subDisplays.count, 1);
+    MTCTLineDisplay* line = (MTCTLineDisplay*) display.subDisplays[0];
+    NSArray<NSArray*>* runs = [self fontRunsOfLine:line];
+    XCTAssertEqual(runs.count, 3);
+    XCTAssertEqualObjects(runs[0][1], @"LMRoman10-Italic");
+    XCTAssertTrue(NSEqualRanges([runs[0][0] rangeValue], NSMakeRange(0, 1)));
+    XCTAssertEqualObjects(runs[1][1], @"LatinModernMath-Regular");
+    XCTAssertEqualObjects(runs[2][1], @"LMRoman10-Italic");
+    XCTAssertTrue(NSEqualRanges([runs[2][0] rangeValue], NSMakeRange(3, 1)));
+}
+
+- (void) testMathitDelimitersStayInMathFont
+{
+    // Condition 2 rejects (, ) per character even though the atoms carry the
+    // italic stamp; matching pdflatex, not MathJax (LLD §3.3 G).
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{(a)}"];
+    XCTAssertEqual(display.subDisplays.count, 1);
+    MTCTLineDisplay* line = (MTCTLineDisplay*) display.subDisplays[0];
+    NSArray<NSArray*>* runs = [self fontRunsOfLine:line];
+    XCTAssertEqual(runs.count, 3);
+    XCTAssertEqualObjects(runs[0][1], @"LatinModernMath-Regular");
+    XCTAssertEqualObjects(runs[1][1], @"LMRoman10-Italic");
+    XCTAssertEqualObjects(runs[2][1], @"LatinModernMath-Regular");
+}
+
+- (void) testMathitLeavesCustomNonOrdinaryAtomInMathFont
+{
+    // +addLatexSymbol:value: is public, so a caller can register a non-Ordinary
+    // atom whose nucleus is routable. \mathit selects a family for class-7
+    // mathchars only, so such an atom keeps the math font.
+    [MTMathAtomFactory addLatexSymbol:@"zzmathitrel"
+                                value:[MTMathAtom atomWithType:kMTMathAtomRelation value:@"R"]];
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{\\zzmathitrel}"];
+    XCTAssertEqual(display.subDisplays.count, 1);
+    MTCTLineDisplay* line = (MTCTLineDisplay*) display.subDisplays[0];
+    NSArray<NSArray*>* runs = [self fontRunsOfLine:line];
+    XCTAssertEqual(runs.count, 1);
+    XCTAssertEqualObjects(runs[0][1], @"LatinModernMath-Regular");
+}
+
+// The direct assertion that \mathit stopped being a no-op: widths move to
+// the companion's advances (LLD §3 contract table; em values from the face).
+- (void) testMathitChangesWidthOfRoutableCharacters
+{
+    CGFloat em = self.font.fontSize;
+    MTMathListDisplay* mathitF = [self displayForLaTeX:@"\\mathit{f}"];
+    MTMathListDisplay* plainF = [self displayForLaTeX:@"f"];
+    XCTAssertEqualWithAccuracy(mathitF.width, 0.307 * em, 0.01 * em);
+    XCTAssertGreaterThan(fabs(plainF.width - mathitF.width), 0.05 * em);
+
+    MTMathListDisplay* mathitOne = [self displayForLaTeX:@"\\mathit{1}"];
+    MTMathListDisplay* plainOne = [self displayForLaTeX:@"1"];
+    XCTAssertEqualWithAccuracy(mathitOne.width, 0.511 * em, 0.01 * em);
+    XCTAssertGreaterThan(fabs(plainOne.width - mathitOne.width), 0.005 * em);
+}
+
+// Regression guard on the categories iosMath already gets right (LLD §2.2):
+// \mathit must not move anything outside the routing domain.
+- (void) testMathitLeavesUnroutedCategoriesUnchanged
+{
+    NSDictionary<NSString*, NSString*>* pairs = @{
+        @"\\mathit{(}": @"(",
+        @"\\mathit{+}": @"+",
+        @"\\mathit{\\alpha}": @"\\alpha",
+        @"\\mathit{\\aleph}": @"\\aleph",
+    };
+    for (NSString* latex in pairs) {
+        MTMathListDisplay* styled = [self displayForLaTeX:latex];
+        MTMathListDisplay* plain = [self displayForLaTeX:pairs[latex]];
+        XCTAssertEqualWithAccuracy(styled.width, plain.width, 0.001, @"%@", latex);
+    }
+}
+
+// The contiguous companion range lets CoreText apply the face's own kern
+// table (cmti10's b->c kern analogue, LLD §3 contract).
+- (void) testMathitAppliesCompanionKerning
+{
+    CGFloat em = self.font.fontSize;
+    MTMathListDisplay* pair = [self displayForLaTeX:@"\\mathit{AV}"];
+    MTMathListDisplay* a = [self displayForLaTeX:@"\\mathit{A}"];
+    MTMathListDisplay* v = [self displayForLaTeX:@"\\mathit{V}"];
+    // AV pair-kerns -0.102 em in lmroman10-italic; allow half as margin.
+    XCTAssertLessThan(pair.width, a.width + v.width - 0.05 * em);
+}
+
+- (void) testMathitAppliesCompanionLigature
+{
+    // One shaped run, one glyph: the f_i ligature. Asserted on glyph count,
+    // not width, since a ligature can be advance-neutral.
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{fi}"];
+    MTCTLineDisplay* line = (MTCTLineDisplay*) display.subDisplays[0];
+    XCTAssertTrue([line isKindOfClass:[MTCTLineDisplay class]]);
+    NSArray* runs = (__bridge NSArray*) CTLineGetGlyphRuns(line.line);
+    XCTAssertEqual(runs.count, 1);
+    XCTAssertEqual(CTRunGetGlyphCount((__bridge CTRunRef) runs[0]), 1);
+}
+
+- (void) testMathitShapingDoesNotCrossStyleBoundary
+{
+    // \mathit{f}i: f in the companion, i in the math font — two runs, two
+    // glyphs, no ligature. The font attribution must partition shaping.
+    MTMathListDisplay* display = [self displayForLaTeX:@"\\mathit{f}i"];
+    MTCTLineDisplay* line = (MTCTLineDisplay*) display.subDisplays[0];
+    XCTAssertTrue([line isKindOfClass:[MTCTLineDisplay class]]);
+    NSArray* runs = (__bridge NSArray*) CTLineGetGlyphRuns(line.line);
+    XCTAssertEqual(runs.count, 2);
+    CFIndex totalGlyphs = 0;
+    for (id run in runs) {
+        totalGlyphs += CTRunGetGlyphCount((__bridge CTRunRef) run);
+    }
+    XCTAssertEqual(totalGlyphs, 2);
+}
+
 @end
