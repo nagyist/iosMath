@@ -42,7 +42,9 @@
     MTCTLineDisplay* lineP = (MTCTLineDisplay*)dP.subDisplays.firstObject;
     XCTAssertTrue([lineP isKindOfClass:[MTCTLineDisplay class]]);
     XCTAssertGreaterThanOrEqual(lineP.inkWidth, 15.08 - 0.01);   // P ink right = 15.08
-    XCTAssertGreaterThan(lineP.inkWidth, lineP.width);           // 15.08 > advance 12.84
+    // ε (2.80) now exceeds P's 2.24 of protruding ink, so the advance alone
+    // covers the ink extent and inkWidth collapses onto width (LLD §5).
+    XCTAssertEqualWithAccuracy(lineP.inkWidth, lineP.width, 0.01);
 
     // Control: x ink (10.54) < advance (11.44) → inkWidth stays the advance.
     MTMathListDisplay* dx = [self displayFor:@"x"];
@@ -169,6 +171,24 @@
     [self assertComposite:[MTInnerDisplay class] bare:@"\\left( V \\right." shifted:@"a\\left( V \\right."];
 }
 
+// The composites above all trail a V, which no longer overhangs, so their getters
+// would still pass with the MAX over children deleted. No plain glyph overhangs
+// its corrected advance any more, but \vec{f}'s accent glyph does (see
+// testAccentGlyphInk), so nesting it is what still forces the child to drive the
+// composite's inkWidth. \sum and \overrightarrow are absent because their own
+// glyph is always wide enough to cover the base -- they can't overhang at all.
+- (void)testCompositeInkTracksOverhangingChild {
+    for (NSArray* c in @[ @[ [MTFractionDisplay class], @"\\frac{1}{\\vec{f}}" ],
+                          @[ [MTRadicalDisplay class],  @"\\sqrt{\\vec{f}}" ],
+                          @[ [MTLineDisplay class],     @"\\overline{\\vec{f}}" ],
+                          @[ [MTInnerDisplay class],    @"\\left( \\vec{f} \\right." ] ]) {
+        MTDisplay* d = [self findDisplayOfClass:c[0] in:[self displayFor:c[1]]];
+        XCTAssertNotNil(d, @"%@", c[1]);
+        XCTAssertGreaterThan(d.inkWidth, d.width, @"%@", c[1]);
+        XCTAssertGreaterThanOrEqual(d.inkWidth, [self composedInkRightOf:d] - 0.01, @"%@", c[1]);
+    }
+}
+
 // Depth-first: the first display of the given class, or nil.
 - (MTDisplay*)findDisplayOfClass:(Class)cls in:(MTDisplay*)d {
     if ([d isKindOfClass:cls]) return d;
@@ -244,7 +264,12 @@
     XCTAssertNotNil(s, @"no %@ in %@", NSStringFromClass(cls), shifted);
     XCTAssertGreaterThanOrEqual(b.inkWidth, [self composedInkRightOf:b] - 0.01);
     XCTAssertGreaterThanOrEqual(s.inkWidth, [self composedInkRightOf:s] - 0.01);
-    XCTAssertGreaterThan(b.inkWidth, b.width);            // trailing child overhangs
+    // Every bare/shifted pair here ends in a trailing V. V's correction (4.28) now
+    // exceeds V's own protruding ink (the same LLD §5 mechanism as the P case in
+    // testCTLineLeafInk), so V no longer overhangs its own advance -- and since V is
+    // always the composite's rightmost child, the composite doesn't overhang either.
+    // "Trailing child overhangs" no longer holds; assert the collapse instead.
+    XCTAssertEqualWithAccuracy(b.inkWidth, b.width, 0.01);
     XCTAssertGreaterThan(s.position.x, b.position.x);     // shifted variant is further right
     XCTAssertEqualWithAccuracy(s.inkWidth - s.width, b.inkWidth - b.width, 0.02);  // basis-invariant
 }

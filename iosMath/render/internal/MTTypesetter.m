@@ -990,9 +990,15 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
                     if (_currentLine.length > 0) {
                         if (interElementSpace > 0) {
                             // add a kerning of that space to the previous character
+                            NSRange prev = [_currentLine.string rangeOfComposedCharacterSequenceAtIndex:_currentLine.length - 1];
+                            // Additive: that character may already carry an italic
+                            // correction, and assigning would drop it.
+                            NSNumber* kern = [_currentLine attribute:(NSString*) kCTKernAttributeName
+                                                             atIndex:prev.location
+                                                      effectiveRange:NULL];
                             [_currentLine addAttribute:(NSString*) kCTKernAttributeName
-                                                 value:[NSNumber numberWithFloat:interElementSpace]
-                                                 range:[_currentLine.string rangeOfComposedCharacterSequenceAtIndex:_currentLine.length - 1]];
+                                                 value:@(kern.floatValue + interElementSpace)
+                                                 range:prev];
                         }
                     } else {
                         // increase the space
@@ -1018,6 +1024,10 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
                 if (atom.fontStyle == kMTFontStyleItalic && atom.type == kMTMathAtomOrdinary) {
                     [self applyMathitFontToRoutableCharactersInRange:appendedRange];
                 }
+                // Deliberately not gated on atom type, unlike the \mathit stamp
+                // above: TeX82 §749 routes all seven noad classes through the same
+                // nucleus conversion, so §755's correction fires for all of them.
+                [self applyItalicCorrectionsInRange:appendedRange forAtom:atom];
                 // add the atom to the current range
                 if (_currentLineIndexRange.location == NSNotFound) {
                     _currentLineIndexRange = atom.indexRange;
@@ -1033,15 +1043,21 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
                 
                 // add super scripts || subscripts
                 if (atom.subScript || atom.superScript) {
+                    CGFloat delta = 0;
+                    if (atom.nucleus.length > 0) {
+                        // Read before the flush clears _currentLine. A non-empty
+                        // nucleus was just appended, so the line's last composed
+                        // sequence is this atom's last character. Keying on the
+                        // atom rather than on _currentLine.length matters: for an
+                        // empty nucleus the line's last character belongs to the
+                        // previous atom, whose correction addDisplayLine has
+                        // already carried into the pen.
+                        NSRange last = [_currentLine.string rangeOfComposedCharacterSequenceAtIndex:_currentLine.length - 1];
+                        delta = [self italicCorrectionInCurrentLineAtIndex:last.location];
+                    }
                     // stash the existing line
                     // We don't check _currentLine.length here since we want to allow empty lines with super/sub scripts.
                     MTCTLineDisplay* line = [self addDisplayLine];
-                    CGFloat delta = 0;
-                    if (atom.nucleus.length > 0) {
-                        // Use the italic correction of the last character.
-                        CGGlyph glyph = [self findGlyphForCharacterAtIndex:atom.nucleus.length - 1 inString:atom.nucleus];
-                        delta = [_styleFont.mathTable getItalicCorrection:glyph];
-                    }
                     if (delta > 0 && !atom.subScript) {
                         // Add a kern of delta
                         _currentPosition.x += delta;
@@ -1065,6 +1081,32 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
     }
 }
 
+// TeX82 §755 drops the correction on an interior character only when the run is
+// set in a text font — a TFM whose FONTDIMEN 2 (SPACE) is nonzero. \math*
+// selects a family, and LaTeX binds most of those families to text TFMs; only
+// these three sit on a math TFM. A style added later must be classified against
+// that table rather than inherit a branch, which is why there is no default:.
+static BOOL MTStyleSuppressesInteriorItalicCorrection(MTFontStyle style)
+{
+    switch (style) {
+        case kMTFontStyleDefault:      // cmmi10
+        case kMTFontStyleCaligraphic:  // cmsy10
+        case kMTFontStyleBoldItalic:   // cmmib10
+        // \mathit re-families class-7 mathchars only, so anything still drawn in
+        // the math font here is cmmi10. Its companion half is suppressed by the
+        // face test in applyItalicCorrectionsInRange:forAtom:.
+        case kMTFontStyleItalic:
+            return NO;
+        case kMTFontStyleRoman:        // cmr10
+        case kMTFontStyleBold:         // cmbx10
+        case kMTFontStyleSansSerif:    // cmss10
+        case kMTFontStyleTypewriter:   // cmtt10
+        case kMTFontStyleFraktur:      // eufm10
+        case kMTFontStyleBlackboard:   // msbm10
+            return YES;
+    }
+}
+
 // Gives maximal runs of routable characters the \mathit companion face.
 // Evaluated per character, not per atom: fusion merges a whole \mathit group
 // into one atom, which can mix routable and non-routable characters
@@ -1085,6 +1127,93 @@ static void getBboxDetails(CGRect bbox, CGFloat* ascent, CGFloat* descent)
                                  range:NSMakeRange(runStart, i - runStart)];
             runStart = NSNotFound;
         }
+    }
+}
+
+// The face stamped at `index`. Every appended range is stamped before anything
+// reads it back, so a missing attribute is a broken invariant rather than
+// something LaTeX input can produce. Defaulting to _styleFont would read the
+// math table for a companion glyph and return a plausible wrong number, which
+// is the defect this path exists to remove.
+- (CTFontRef) faceInCurrentLineAtIndex:(NSUInteger) index
+{
+    CTFontRef face = (__bridge CTFontRef) [_currentLine attribute:(NSString*) kCTFontAttributeName
+                                                          atIndex:index
+                                                   effectiveRange:NULL];
+    NSAssert(face != NULL, @"No font stamped at index %lu of '%@'",
+             (unsigned long) index, _currentLine.string);
+    return face;
+}
+
+// The italic correction of the composed character sequence at `index`, from the
+// face that drew it. _currentLine can carry two faces — \mathit routes some
+// characters to the companion — and a CoreText glyph id means nothing without
+// its font, so the glyph is resolved against the same face the metric comes
+// from. This must stay the only way to ask for this number.
+- (CGFloat) italicCorrectionInCurrentLineAtIndex:(NSUInteger) index
+{
+    CTFontRef face = [self faceInCurrentLineAtIndex:index];
+    NSString* string = _currentLine.string;
+    NSRange range = [string rangeOfComposedCharacterSequenceAtIndex:index];
+    unichar chars[range.length];
+    [string getCharacters:chars range:range];
+    CGGlyph glyphs[range.length];
+    if (!CTFontGetGlyphsForCharacters(face, chars, glyphs, range.length)) {
+        // Same convention as findGlyphForCharacterAtIndex:inString:. Measuring
+        // notdef would return a correction for a box that is never drawn.
+        return 0;
+    }
+    if (CFEqual(face, _styleFont.ctFont)) {
+        return [_styleFont.mathTable getItalicCorrection:glyphs[0]];
+    }
+    // No text-italic face available to us carries a MATH table, so the
+    // correction is the ink overhanging the advance — the metric MathJax bakes
+    // into its -tex-mathit table.
+    CGRect bounds = CTFontGetBoundingRectsForGlyphs(face, kCTFontOrientationDefault, glyphs, NULL, 1);
+    CGSize advance;
+    CTFontGetAdvancesForGlyphs(face, kCTFontOrientationDefault, glyphs, &advance, 1);
+    return MAX(0, CGRectGetMaxX(bounds) - advance.width);
+}
+
+// TeX Rule 17: a kern of the glyph's italic correction after each character of
+// `range` whose subscript is empty, with Rule 14's interior suppression.
+- (void) applyItalicCorrectionsInRange:(NSRange) range forAtom:(MTMathAtom*) atom
+{
+    NSString* string = _currentLine.string;
+    NSUInteger i = range.location;
+    while (i < NSMaxRange(range)) {
+        NSRange sequence = [string rangeOfComposedCharacterSequenceAtIndex:i];
+        NSUInteger next = NSMaxRange(sequence);
+        BOOL apply;
+        if (next >= NSMaxRange(range)) {
+            // Last character of the atom, and nothing ever suppresses the
+            // correction there. When it carries a script the script path applies
+            // it instead, so the two paths own this character exclusively.
+            apply = !atom.subScript && !atom.superScript;
+        } else {
+            CTFontRef face = [self faceInCurrentLineAtIndex:i];
+            if (!CFEqual(face, [self faceInCurrentLineAtIndex:next])) {
+                // A face change is a family change, so TeX never marks this
+                // character math_text_char and §755's AND cannot fire.
+                apply = YES;
+            } else {
+                // Interior of a single-face run: kept only for a math font.
+                apply = CFEqual(face, _styleFont.ctFont)
+                        && !MTStyleSuppressesInteriorItalicCorrection(atom.fontStyle);
+            }
+        }
+        // The MATH-table metric is signed and TeX applies it with its sign, so
+        // the test is != 0 rather than > 0.
+        CGFloat correction = apply ? [self italicCorrectionInCurrentLineAtIndex:i] : 0;
+        if (correction != 0) {
+            NSNumber* kern = [_currentLine attribute:(NSString*) kCTKernAttributeName
+                                             atIndex:i
+                                      effectiveRange:NULL];
+            [_currentLine addAttribute:(NSString*) kCTKernAttributeName
+                                 value:@(kern.floatValue + correction)
+                                 range:sequence];
+        }
+        i = next;
     }
 }
 
